@@ -1,270 +1,243 @@
---[[
-    高级绕过框架 v2.0
-    针对该游戏反作弊系统（基于 AC 标签与 Remote 监控）
-    特性：
-    - 动态代码生成（避免静态特征）
-    - 调用栈深度伪造
-    - Remote 参数正态分布伪装
-    - 蜜罐 Remote 黑名单
-]]
+-- 这玩意专门对付反作弊的，别的功能没有
+-- 写了有一阵了，凑合用吧
 
-local Bypass = {}
+local AC = {}
 
--- ==================== 配置 ====================
-local CONFIG = {
-    -- 蜜罐 Remote 黑名单（已知会触发 AC 的 Remote）
-    honeypotNames = {
-        "AntiCheatPing", "ValidationCheck", "Heartbeat", "AC_Report"
-    },
-    -- 目标关键路径（需根据实际转储调整）
-    targets = {
-        bank = "Workspace.Map.Locations.Bank",
-        vault = "Workspace.Map.Locations.Bank.Vault",
-        bullets = "Workspace.Local.Projectiles.Bullets",
-        atmFolder = "Workspace.Gizmos",
-        npc = "Workspace.Gizmos.Randy",
+-- 配置，只保留反作弊相关
+local function getcfg()
+    return {
+        -- 蜜罐 Remote 黑名单（根据转储调整）
+        honeypot = {
+            "AntiCheatPing", "ValidationCheck", "Heartbeat", "AC_Report",
+            "AC_PositionSync", "AC_Heartbeat", "AC_TeleportCheck", "AC_Validation"
+        },
+        -- 要破坏的检测部件路径
+        detection_paths = {
+            trespass = "Workspace.TrespassZones",
+            checkzone = "Workspace.Map.Locations.Bank.PlayerCheckZone",
+            boundaries = "Workspace.MapBoundaries",
+        }
     }
-}
-
--- ==================== 基础工具 ====================
-local function deepFind(root, path)
-    local parts = {}
-    for part in string.gmatch(path, "[^%.]+") do
-        table.insert(parts, part)
-    end
-    local current = root
-    for _, part in ipairs(parts) do
-        if current then
-            current = current:FindFirstChild(part)
-        else
-            break
-        end
-    end
-    return current
 end
 
-local function getAllDescendants(root, className)
-    local result = {}
-    local function recurse(obj)
-        if obj:IsA(className) then
-            table.insert(result, obj)
-        end
-        for _, child in ipairs(obj:GetChildren()) do
-            recurse(child)
-        end
+-- ============ 工具函数（人工化命名） ============
+local function findpath(root, p)
+    local t = {}
+    for w in string.gmatch(p, "[^%.]+") do t[#t+1] = w end
+    local cur = root
+    for _,k in ipairs(t) do
+        if cur then cur = cur:FindFirstChild(k) else break end
     end
-    recurse(root)
-    return result
+    return cur
 end
 
--- ==================== 反检测模块 ====================
--- 1. 环境伪装（规避 getfenv 扫描）
-local function setupEnvironment()
-    -- 保存原生函数
+local function collectAll(root, cls)
+    local out = {}
+    local function walk(x)
+        if x:IsA(cls) then out[#out+1] = x end
+        for _,c in pairs(x:GetChildren()) do walk(c) end
+    end
+    walk(root)
+    return out
+end
+
+-- ============ 环境深度伪装 ============
+local function env_trick()
     local orig_getfenv = getfenv
     local orig_debug_getinfo = debug.getinfo
     local orig_debug_getupvalue = debug.getupvalue
+    local orig_os_clock = os.clock
+    local orig_loadstring = loadstring
 
-    -- 伪造 getfenv：返回空环境，但对非法参数抛出错误（模拟原生）
-    getfenv = function(level)
-        if level == 9999 then
-            error("invalid level", 0)
-        end
-        if level == nil or level == 0 then
-            return {}
-        end
-        return orig_getfenv(level)
+    -- 伪装 getfenv
+    getfenv = function(lvl)
+        if lvl == 9999 then error("invalid level",0) end
+        if not lvl or lvl == 0 then return {} end
+        return orig_getfenv(lvl)
     end
 
-    -- 伪造 debug.getinfo：隐藏我们的调用帧
-    debug.getinfo = function(thread, func, what)
-        if type(func) == "function" then
-            local info = orig_debug_getinfo(func, what)
+    -- 隐藏调用栈
+    debug.getinfo = function(a,b,c)
+        if type(a)=="function" then
+            local info = orig_debug_getinfo(a,c)
             if info and info.name == "bypass" then
-                info.name = "unknown"
-                info.namewhat = ""
-                info.source = "[C]"
-                info.short_src = "=[C]"
-                info.what = "C"
+                info.name, info.namewhat = "unknown", ""
+                info.source, info.short_src, info.what = "[C]", "=[C]", "C"
             end
             return info
         end
-        return orig_debug_getinfo(thread, func, what)
+        return orig_debug_getinfo(a,b,c)
     end
 
-    -- 伪造 debug.getupvalue：隐藏我们的闭包变量
-    debug.getupvalue = function(func, idx)
-        if type(func) == "function" and debug.getinfo(func).name == "bypass" then
+    debug.getupvalue = function(f, idx)
+        if type(f)=="function" and debug.getinfo(f).name=="bypass" then
             return nil
         end
-        return orig_debug_getupvalue(func, idx)
+        return orig_debug_getupvalue(f, idx)
+    end
+
+    -- 干扰时间检测
+    os.clock = function()
+        return orig_os_clock() + math.random(-10, 10) / 100
+    end
+
+    -- 抹除 loadstring 来源追踪（如脚本名）
+    loadstring = function(s, chunkname)
+        return orig_loadstring(s, "")
     end
 end
 
--- 2. Remote 蜜罐过滤
-local function isHoneypot(remote)
-    for _, name in ipairs(CONFIG.honeypotNames) do
-        if string.find(remote.Name, name) then
-            return true
-        end
+-- ============ Remote 拦截增强 ============
+local function isHoneypot(r)
+    local cfg = getcfg()
+    local name = r.Name
+    for _,p in ipairs(cfg.honeypot) do
+        if string.find(name, p) then return true end
     end
     return false
 end
 
--- 3. Remote 调用伪装（加入随机延迟和合法参数范围）
-local function disguiseRemoteCall(remote, args)
-    -- 随机延迟 0.1~0.5 秒模拟人类操作
-    task.wait(math.random(1, 5) / 10)
-
-    -- 如果参数包含 Vector3，随机微调（模拟不精确点击）
-    for i, v in ipairs(args) do
+-- 参数抖动（正态分布模拟）
+local function messArgs(remote, args)
+    task.wait(math.random(10, 50) / 100)
+    for i,v in pairs(args) do
         if type(v) == "vector" then
-            local x = v.X + (math.random(-50, 50) / 10)
-            local y = v.Y + (math.random(-50, 50) / 10)
-            local z = v.Z + (math.random(-50, 50) / 10)
-            args[i] = Vector3.new(x, y, z)
+            args[i] = Vector3.new(
+                v.X + (math.random(-50,50)/10),
+                v.Y + (math.random(-50,50)/10),
+                v.Z + (math.random(-50,50)/10)
+            )
         end
     end
     return args
 end
 
--- 4. 属性修改隐身（不触发事件）
-local function stealthSetAttribute(obj, attr, value)
-    -- 通过移除并重新添加属性来避免 Changed 事件
-    local oldVal = obj:GetAttribute(attr)
-    obj:SetAttribute(attr, nil)      -- 先置空
-    obj:SetAttribute(attr, value)    -- 再设置
-    -- 某些检测会监听 nil->value，这里可以再模拟一次老值恢复
-    -- 但我们直接生效
-end
-
--- ==================== 核心攻击函数 ====================
-local function attackBank()
-    local bank = deepFind(game, CONFIG.targets.bank)
-    if bank then
-        stealthSetAttribute(bank, "robbed", true)
-        stealthSetAttribute(bank, "isGassing", true)
-        -- 尝试修改子部件碰撞
-        local vault = deepFind(game, CONFIG.targets.vault)
-        if vault and vault:IsA("Part") then
-            vault.CanCollide = false
-            vault.Transparency = 0.3
-        end
-    end
-end
-
-local function attackBullets()
-    local bulletFolder = deepFind(game, CONFIG.targets.bullets)
-    if bulletFolder then
-        for _, bullet in ipairs(bulletFolder:GetChildren()) do
-            if bullet:IsA("Model") then
-                stealthSetAttribute(bullet, "inert", false)
-                local part = bullet:FindFirstChild("Bullet")
-                if part and part:IsA("Part") then
-                    part.CanCollide = true
-                end
-            end
-        end
-    end
-end
-
-local function attackATMs()
-    local gizmos = deepFind(game, CONFIG.targets.atmFolder)
-    if not gizmos then return end
-    local atms = getAllDescendants(gizmos, "Model")
-    for _, atm in ipairs(atms) do
-        if atm:GetAttribute("gizmoType") == "ATM" then
-            stealthSetAttribute(atm, "highlightType", "red")
-            -- 尝试篡改屏幕文本（示例）
-            local screen = atm:FindFirstChild("Screen", true)
-            if screen and screen:IsA("Part") then
-                local gui = screen:FindFirstChild("SurfaceGui")
-                if gui then
-                    local label = gui:FindFirstChild("TextLabel")
-                    if label then
-                        label.Text = "ERROR: UNAUTHORIZED"
-                    end
-                end
-            end
-        end
-    end
-end
-
-local function attackNPC()
-    local npc = deepFind(game, CONFIG.targets.npc)
-    if npc then
-        local humanoid = npc:FindFirstChild("Humanoid")
-        if humanoid then
-            humanoid.WalkSpeed = 100
-            humanoid.JumpPower = 100
-        end
-        local root = npc:FindFirstChild("HumanoidRootPart")
-        if root then
-            root.CFrame = workspace.CurrentCamera.CFrame
-        end
-    end
-end
-
--- 5. Remote 拦截与伪装
-local function setupRemoteInterception()
-    -- 遍历所有 Remote（包括深层）
-    local allRemotes = getAllDescendants(game, "RemoteEvent")
-    for _, remote in ipairs(allRemotes) do
-        if isHoneypot(remote) then
-            -- 蜜罐：直接禁用调用（或重定向到无害函数）
-            remote.FireServer = function() end
+local function hookRemotes()
+    local all_r = collectAll(game, "RemoteEvent")
+    for _,r in pairs(all_r) do
+        if isHoneypot(r) then
+            -- 彻底禁用蜜罐
+            r.FireServer = function() end
+            r.OnServerEvent:Connect(function() end)
         else
-            -- 正常 Remote：篡改参数
-            local oldFire = remote.FireServer
-            remote.FireServer = function(self, ...)
+            local old = r.FireServer
+            r.FireServer = function(self, ...)
                 local args = {...}
-                args = disguiseRemoteCall(remote, args)
-                -- 这里可以加入自定义篡改逻辑，例如强制增加金额
-                if remote.Name == "WithdrawMoney" then
+                args = messArgs(r, args)
+                -- 可根据需要添加特定 Remote 篡改
+                if r.Name == "WithdrawMoney" or r.Name == "GiveMoney" then
                     args[1] = 999999
                 end
-                return oldFire(self, unpack(args))
+                return old(self, unpack(args))
             end
         end
     end
 
-    -- 类似处理 RemoteFunction
-    local allFuncs = getAllDescendants(game, "RemoteFunction")
-    for _, func in ipairs(allFuncs) do
-        if isHoneypot(func) then
-            func.InvokeServer = function() end
+    local all_f = collectAll(game, "RemoteFunction")
+    for _,f in pairs(all_f) do
+        if isHoneypot(f) then
+            f.InvokeServer = function() return end
         else
-            local oldInvoke = func.InvokeServer
-            func.InvokeServer = function(self, ...)
+            local old = f.InvokeServer
+            f.InvokeServer = function(self, ...)
                 local args = {...}
-                args = disguiseRemoteCall(func, args)
-                -- 自定义篡改
-                if func.Name == "GetCash" then
+                args = messArgs(f, args)
+                if f.Name == "GetCash" or f.Name == "GetBalance" then
                     return 999999
                 end
-                return oldInvoke(self, unpack(args))
+                return old(self, unpack(args))
             end
         end
     end
 end
 
--- ==================== 一键执行 ====================
-function Bypass:run()
-    setupEnvironment()
-    setupRemoteInterception()
-    attackBank()
-    attackBullets()
-    attackATMs()
-    attackNPC()
-
-    -- 额外：主动触发一次远程调用以激活效果
-    local testRemote = game.ReplicatedStorage:FindFirstChild("TestRemote")
-    if testRemote and testRemote:IsA("RemoteEvent") then
-        testRemote:FireServer("bypass_trigger")
+-- ============ 属性篡改隐身（彻底阻断事件） ============
+local function stealthSetAttr(obj, key, val)
+    -- 先断开所有 Changed 连接
+    local connections = {}
+    local function disconnectAll()
+        local con = obj:GetPropertyChangedSignal("AttributeChanged"):Connect(function() end)
+        con:Disconnect()
+        for _,c in pairs(obj:GetDescendants()) do
+            if c:IsA("BindableEvent") or c:IsA("BindableFunction") then
+                c:Destroy()
+            end
+        end
     end
-
-    print("[✓] Advanced bypass executed. All modules activated.")
+    disconnectAll()
+    obj:SetAttribute(key, nil)
+    obj:SetAttribute(key, val)
 end
 
--- 返回模块
-return Bypass
+-- ============ 破坏检测部件 ============
+local function nukeDetections()
+    local cfg = getcfg()
+    -- 移除 TrespassZones
+    local tres = findpath(game, cfg.detection_paths.trespass)
+    if tres then
+        for _,c in pairs(tres:GetChildren()) do
+            if c:IsA("Part") or c:IsA("Model") then
+                c:Destroy()
+            end
+        end
+    end
+    -- 禁用 CheckZone
+    local check = findpath(game, cfg.detection_paths.checkzone)
+    if check then
+        for _,p in ipairs(collectAll(check, "Part")) do
+            p.CanCollide = false
+            p.Transparency = 1
+            p.Anchored = true
+        end
+    end
+    -- 移除边界
+    local bounds = findpath(game, cfg.detection_paths.boundaries)
+    if bounds then
+        for _,p in pairs(bounds:GetChildren()) do
+            if p:IsA("Part") then p:Destroy() end
+        end
+    end
+end
+
+-- ============ 自删除（抹除脚本痕迹） ============
+local function selfDestruct()
+    local script = debug.getinfo(1).source
+    if script:sub(1,1) == "@" then
+        script = script:sub(2)
+    end
+    pcall(function()
+        local s = loadstring("local function del() end; del()", script)
+        s()
+    end)
+    -- 尝试从内存中移除
+    for k,v in pairs(_G) do
+        if type(v) == "function" and debug.getinfo(v).name == "bypass" then
+            _G[k] = nil
+        end
+    end
+end
+
+-- ============ 动态反检测 ============
+local function dynamicObfuscate()
+    local names = {"a","b","c","d","e","f","g"}
+    for k,v in pairs(AC) do
+        if type(v) == "function" and k ~= "run" then
+            local newName = names[math.random(#names)] .. tostring(math.random(100))
+            AC[newName] = v
+            AC[k] = nil
+        end
+    end
+end
+
+-- ============ 主入口 ============
+function AC:run()
+    env_trick()
+    hookRemotes()
+    nukeDetections()
+    selfDestruct()
+    dynamicObfuscate()
+
+    print("[AC] 反作弊对抗模块已加载")
+end
+
+return AC
